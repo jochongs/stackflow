@@ -253,7 +253,7 @@ export function useStyleEffectSwipeBack({
             renderComponent(renderX, ratio);
 
             if (targetX - currX < 10) {
-              renderComponent(targetX, 100);
+              renderComponent(targetX, 1);
               resolve();
             } else {
               animationId = requestAnimationFrame(animateSwipeBackSuccess);
