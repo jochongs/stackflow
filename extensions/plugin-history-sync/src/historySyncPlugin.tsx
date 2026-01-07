@@ -28,12 +28,13 @@ import type { NavigationProcess } from "./NavigationProcess/NavigationProcess";
 import { SerialNavigationProcess } from "./NavigationProcess/SerialNavigationProcess";
 import { normalizeActivityRouteMap } from "./normalizeActivityRouteMap";
 import { Publisher } from "./Publisher";
-import type { RouteLike } from "./RouteLike";
+import {
+  type HistoryEntry,
+  interpretDefaultHistoryOption,
+  type RouteLike,
+} from "./RouteLike";
 import { RoutesProvider } from "./RoutesContext";
 import { sortActivityRoutes } from "./sortActivityRoutes";
-
-const SECOND = 1000;
-const MINUTE = 60 * SECOND;
 
 type ConfigHistorySync = {
   makeTemplate: typeof makeTemplate;
@@ -255,112 +256,184 @@ export function historySyncPlugin<
           ...searchParams,
           ...pathParams,
         };
-        const defaultHistory =
-          targetActivityRoute.defaultHistory?.(params) ?? [];
-
-        initialSetupProcess = new SerialNavigationProcess([
-          ...defaultHistory.map(
-            ({ activityName, activityParams, additionalSteps = [] }) =>
-              () => {
-                const events: (
-                  | Omit<PushedEvent, "eventDate">
-                  | Omit<StepPushedEvent, "eventDate">
-                )[] = [
-                  {
-                    name: "Pushed",
-                    id: id(),
-                    activityId: id(),
-                    activityName,
-                    activityParams: {
-                      ...activityParams,
-                    },
-                    activityContext: {
-                      path: currentPath,
-                      lazyActivityComponentRenderContext: {
-                        shouldRenderImmediately: true,
-                      },
-                    },
-                  },
-                  ...additionalSteps.map(
-                    ({
-                      stepParams,
-                      hasZIndex,
-                    }): Omit<StepPushedEvent, "eventDate"> => ({
-                      name: "StepPushed",
-                      id: id(),
-                      stepId: id(),
-                      stepParams,
-                      hasZIndex,
-                    }),
-                  ),
-                ];
-
-                for (const event of events) {
-                  if (event.name === "Pushed") {
-                    activityActivationMonitors.push(
-                      new DefaultHistoryActivityActivationMonitor(
-                        event.activityId,
-                        initialSetupProcess!,
-                      ),
-                    );
-                  }
-                }
-
-                return events;
-              },
-          ),
-          () => [
-            {
-              name: "Pushed",
-              id: id(),
-              activityId: id(),
-              activityName: targetActivityRoute.activityName,
-              activityParams:
-                makeTemplate(
-                  targetActivityRoute,
-                  options.urlPatternOptions,
-                ).parse(currentPath) ??
-                urlSearchParamsToMap(pathToUrl(currentPath).searchParams),
-              activityContext: {
-                path: currentPath,
-                lazyActivityComponentRenderContext: {
-                  shouldRenderImmediately: true,
-                },
+        const defaultHistory = interpretDefaultHistoryOption(
+          targetActivityRoute.defaultHistory,
+          params,
+        );
+        const historyEntryToEvents = ({
+          activityName,
+          activityParams,
+          additionalSteps = [],
+        }: HistoryEntry): (
+          | Omit<PushedEvent, "eventDate">
+          | Omit<StepPushedEvent, "eventDate">
+        )[] => [
+          {
+            name: "Pushed",
+            id: id(),
+            activityId: id(),
+            activityName,
+            activityParams: {
+              ...activityParams,
+            },
+            activityContext: {
+              path: currentPath,
+              lazyActivityComponentRenderContext: {
+                shouldRenderImmediately: true,
               },
             },
-          ],
-        ]);
+          },
+          ...additionalSteps.map(
+            ({
+              stepParams,
+              hasZIndex,
+            }): Omit<StepPushedEvent, "eventDate"> => ({
+              name: "StepPushed",
+              id: id(),
+              stepId: id(),
+              stepParams,
+              hasZIndex,
+            }),
+          ),
+        ];
+        const createTargetActivityPushEvent = (): Omit<
+          PushedEvent,
+          "eventDate"
+        > => ({
+          name: "Pushed",
+          id: id(),
+          activityId: id(),
+          activityName: targetActivityRoute.activityName,
+          activityParams:
+            makeTemplate(targetActivityRoute, options.urlPatternOptions).parse(
+              currentPath,
+            ) ?? urlSearchParamsToMap(pathToUrl(currentPath).searchParams),
+          activityContext: {
+            path: currentPath,
+            lazyActivityComponentRenderContext: {
+              shouldRenderImmediately: true,
+            },
+          },
+        });
 
-        return initialSetupProcess
+        if (defaultHistory.skipDefaultHistorySetupTransition) {
+          initialSetupProcess = new SerialNavigationProcess([
+            () => [
+              ...defaultHistory.entries.flatMap((historyEntry) =>
+                historyEntryToEvents(historyEntry).map((event) => {
+                  if (event.name !== "Pushed") return event;
+
+                  activityActivationMonitors.push(
+                    new DefaultHistoryActivityActivationMonitor(
+                      event.activityId,
+                      initialSetupProcess!,
+                    ),
+                  );
+
+                  return {
+                    ...event,
+                    skipEnterActiveState: true,
+                  };
+                }),
+              ),
+              {
+                ...createTargetActivityPushEvent(),
+                skipEnterActiveState: true,
+              },
+            ],
+          ]);
+        } else {
+          initialSetupProcess = new SerialNavigationProcess([
+            ...defaultHistory.entries.map((historyEntry) => () => {
+              return historyEntryToEvents(historyEntry).map((event) => {
+                if (event.name !== "Pushed") return event;
+
+                activityActivationMonitors.push(
+                  new DefaultHistoryActivityActivationMonitor(
+                    event.activityId,
+                    initialSetupProcess!,
+                  ),
+                );
+
+                return {
+                  ...event,
+                };
+              });
+            }),
+            () => [createTargetActivityPushEvent()],
+          ]);
+        }
+
+        const now = Date.now();
+        const initialEvents = initialSetupProcess
           .captureNavigationOpportunity(null)
-          .map((event) => ({
+          .map((event, index, array) => ({
             ...event,
-            eventDate: Date.now() - MINUTE,
+            eventDate: now - (array.length - index),
           }));
+        const firstPushEvent = initialEvents.find(
+          (event) => event.name === "Pushed",
+        );
+
+        return initialEvents.map((event) => {
+          if (event.id !== firstPushEvent?.id) return event;
+
+          return {
+            ...event,
+            skipEnterActiveState: true,
+          };
+        });
       },
       onInit({ actions: { getStack, dispatchEvent, push, stepPush } }) {
         const stack = getStack();
-        const rootActivity = stack.activities[0];
 
-        const match = activityRoutes.find(
-          (r) => r.activityName === rootActivity.name,
-        )!;
-        const template = makeTemplate(match, options.urlPatternOptions);
+        if (parseState(history.location.state) === null) {
+          for (const activity of stack.activities) {
+            if (
+              activity.transitionState === "enter-active" ||
+              activity.transitionState === "enter-done"
+            ) {
+              const match = activityRoutes.find(
+                (r) => r.activityName === activity.name,
+              )!;
+              const template = makeTemplate(match, options.urlPatternOptions);
 
-        const lastStep = last(rootActivity.steps);
+              if (activity.isRoot) {
+                replaceState({
+                  history,
+                  pathname: template.fill(activity.params),
+                  state: {
+                    activity: activity,
+                  },
+                  useHash: options.useHash,
+                });
+              } else {
+                pushState({
+                  history,
+                  pathname: template.fill(activity.params),
+                  state: {
+                    activity: activity,
+                  },
+                  useHash: options.useHash,
+                });
+              }
 
-        requestHistoryTick(() => {
-          silentFlag = true;
-          replaceState({
-            history,
-            pathname: template.fill(rootActivity.params),
-            state: {
-              activity: rootActivity,
-              step: lastStep,
-            },
-            useHash: options.useHash,
-          });
-        });
+              for (const step of activity.steps) {
+                if (!step.exitedBy && step.enteredBy.name !== "Pushed") {
+                  pushState({
+                    history,
+                    pathname: template.fill(step.params),
+                    state: {
+                      activity: activity,
+                      step: step,
+                    },
+                    useHash: options.useHash,
+                  });
+                }
+              }
+            }
+          }
+        }
 
         const onPopState: Listener = (e) => {
           if (silentFlag) {
